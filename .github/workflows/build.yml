@@ -13,6 +13,11 @@ env:
   # Headless testing needs the offscreen QPA platform.
   QT_QPA_PLATFORM: offscreen
 
+# Required for softprops/action-gh-release to create releases & upload
+# assets on tag pushes.
+permissions:
+  contents: write
+
 jobs:
   test:
     name: Run tests
