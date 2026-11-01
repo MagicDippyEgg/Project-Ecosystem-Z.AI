@@ -59,10 +59,10 @@ BIOME_PARAMS: Dict[Biome, Dict[str, float]] = {
     Biome.DEEP_WATER:   {"growth_rate": 0.0, "max_food": 0.0, "passable": 0.0, "water_tile": 1.0, "food_value": 0.0},
     Biome.SHALLOW_WATER:{"growth_rate": 0.0, "max_food": 0.0, "passable": 0.4, "water_tile": 1.0, "food_value": 0.0},
     Biome.BEACH:        {"growth_rate": 0.05,"max_food": 8.0, "passable": 1.0, "water_tile": 0.0, "food_value": 1.0},
-    Biome.GRASSLAND:    {"growth_rate": 0.20,"max_food": 22.0,"passable": 1.0, "water_tile": 0.0, "food_value": 1.0},
-    Biome.FOREST:       {"growth_rate": 0.26,"max_food": 32.0,"passable": 0.9, "water_tile": 0.0, "food_value": 1.2},
-    Biome.JUNGLE:       {"growth_rate": 0.30,"max_food": 40.0,"passable": 0.7, "water_tile": 0.0, "food_value": 1.4},
-    Biome.SAVANNA:      {"growth_rate": 0.12,"max_food": 14.0,"passable": 1.0, "water_tile": 0.0, "food_value": 1.0},
+    Biome.GRASSLAND:    {"growth_rate": 0.28,"max_food": 28.0,"passable": 1.0, "water_tile": 0.0, "food_value": 1.0},
+    Biome.FOREST:       {"growth_rate": 0.36,"max_food": 38.0,"passable": 0.9, "water_tile": 0.0, "food_value": 1.2},
+    Biome.JUNGLE:       {"growth_rate": 0.42,"max_food": 45.0,"passable": 0.7, "water_tile": 0.0, "food_value": 1.4},
+    Biome.SAVANNA:      {"growth_rate": 0.17,"max_food": 18.0,"passable": 1.0, "water_tile": 0.0, "food_value": 1.0},
     Biome.DESERT:       {"growth_rate": 0.02,"max_food": 4.0, "passable": 0.85,"water_tile": 0.0, "food_value": 0.6},
     Biome.ROCK:         {"growth_rate": 0.0, "max_food": 0.0, "passable": 0.75,"water_tile": 0.0, "food_value": 0.0},
     Biome.SNOW:         {"growth_rate": 0.01,"max_food": 3.0, "passable": 0.6, "water_tile": 0.0, "food_value": 0.4},
@@ -194,13 +194,21 @@ class World:
     seed: int
     tiles: List[Tile] = field(default_factory=list)
     resources: List[ResourceNode] = field(default_factory=list)
-    # Grid index from (x, y) -> tile index.
+    # Grid index from (x, y) -> tile. Stored as a flat list for O(1)
+    # access without dict/tuple overhead (tile_at is called millions of
+    # times per second during simulation).
     _index: Dict[Tuple[int, int], int] = field(default_factory=dict, repr=False)
+    _tile_grid: List[List[Optional["Tile"]]] = field(default_factory=list, repr=False)
     time_of_day: float = 0.25  # 0..1, 0=midnight, 0.25=dawn, 0.5=noon, 0.75=dusk
     day_length: int = 240      # ticks per in-world day
     tick: int = 0
     mean_temperature: float = 0.55
     name: str = "Primary World"
+    # Landmass labels: _landmass[x][y] = connected-component id of safe
+    # (passable >= 0.85) tiles. Two tiles are mutually reachable on foot
+    # iff they share the same landmass id. Computed once at generation.
+    _landmass: List[List[int]] = field(default_factory=list, repr=False)
+    _landmass_count: int = 0
 
     # ----- construction --------------------------------------------------
     @classmethod
@@ -247,6 +255,8 @@ class World:
                     food=0.0, has_water=(biome in (Biome.DEEP_WATER, Biome.SHALLOW_WATER)),
                 )
                 # Initial plant food so herbivores don't starve on tick 1.
+                # 35% of cap — enough to start but not so much that the
+                # population overshoots carrying capacity instantly.
                 cap = tile.params["max_food"]
                 tile.food = rng.uniform(0.0, cap * 0.35) if cap > 0 else 0.0
                 idx = len(tiles)
@@ -254,9 +264,10 @@ class World:
                 world._index[(i, j)] = idx
         world.tiles = tiles
 
-        # Sprinkle a few water resource nodes (springs) in dry-but-passable
-        # biomes so creatures can drink away from lakes.
-        for _ in range(max(2, (width * height) // 600)):
+        # Sprinkle water springs in dry-but-passable biomes so creatures
+        # can drink away from lakes/rivers. More springs = better
+        # hydration coverage for large continents.
+        for _ in range(max(4, (width * height) // 350)):
             for _attempt in range(20):
                 i = rng.randrange(width)
                 j = rng.randrange(height)
@@ -272,10 +283,159 @@ class World:
                     )
                     world.resources.append(node)
                     break
+        world._compute_landmasses()
+        world._build_tile_grid()
         return world
+
+    # ----- landmass / reachability --------------------------------------
+    def _compute_landmasses(self) -> None:
+        """Flood-fill connected components of solid-ground tiles.
+
+        Two tiles are on the same landmass (mutually reachable on foot
+        without entering water) iff they share the same id in
+        ``self._landmass``. Water and low-passability tiles get id -1.
+        """
+        w, h = self.width, self.height
+        # Use a flat list indexed by x * h + y for speed.
+        labels = [-1] * (w * h)
+        current_id = 0
+        from collections import deque
+        for sx in range(w):
+            for sy in range(h):
+                idx = sx * h + sy
+                if labels[idx] != -1:
+                    continue
+                tile = self.tile_at(sx, sy)
+                if tile is None or tile.params["passable"] < 0.85:
+                    continue
+                # BFS from this seed.
+                queue = deque()
+                queue.append((sx, sy))
+                labels[idx] = current_id
+                while queue:
+                    cx, cy = queue.popleft()
+                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        nx, ny = cx + dx, cy + dy
+                        if not (0 <= nx < w and 0 <= ny < h):
+                            continue
+                        nidx = nx * h + ny
+                        if labels[nidx] != -1:
+                            continue
+                        nt = self.tile_at(nx, ny)
+                        if nt is None or nt.params["passable"] < 0.85:
+                            continue
+                        labels[nidx] = current_id
+                        queue.append((nx, ny))
+                current_id += 1
+        # Convert flat list to 2D for O(1) lookup.
+        self._landmass = [[labels[x * h + y] for y in range(h)] for x in range(w)]
+        self._landmass_count = current_id
+
+    def landmass_id(self, x: float, y: float) -> int:
+        """Return the landmass id at ``(x, y)``, or -1 if water/unsafe."""
+        ix, iy = int(x), int(y)
+        if ix < 0 or iy < 0 or ix >= self.width or iy >= self.height:
+            return -1
+        if not self._landmass:
+            return -1
+        return self._landmass[ix][iy]
+
+    def same_landmass(self, x1: float, y1: float, x2: float, y2: float) -> bool:
+        """True if both points are on the same connected landmass."""
+        a = self.landmass_id(x1, y1)
+        b = self.landmass_id(x2, y2)
+        return a != -1 and a == b
+
+    def is_safe_tile(self, x: float, y: float, threshold: float = 0.85) -> bool:
+        """True if the tile at ``(x, y)`` is solid ground for a land organism."""
+        tile = self.tile_at(int(x), int(y))
+        return tile is not None and tile.params["passable"] >= threshold
+
+    def can_drink_at(self, x: float, y: float) -> bool:
+        """True if an organism at ``(x, y)`` can drink without moving.
+
+        Checks for adjacent (8-neighbourhood) water tiles or a water
+        resource node on the same tile. The organism stays on solid
+        ground and drinks from the shore.
+        """
+        ix, iy = int(x), int(y)
+        # Water resource node on this tile?
+        for res in self.resources:
+            if res.kind.name == "WATER" and abs(res.x - x) <= 1.5 and abs(res.y - y) <= 1.5:
+                return True
+        # Adjacent water tile?
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                tile = self.tile_at(ix + dx, iy + dy)
+                if tile is not None and tile.has_water:
+                    return True
+        return False
+
+    def nearest_drinking_spot(self, x: float, y: float, radius: int) -> Optional[Tuple[float, float]]:
+        """Find the nearest safe tile from which the organism can drink.
+
+        Scans tiles within ``radius`` of ``(x, y)`` and returns the
+        closest one that is safe (solid ground) AND has water adjacent.
+        Only returns tiles on the same landmass as the organism.
+        """
+        cx, cy = int(x), int(y)
+        my_landmass = self.landmass_id(x, y)
+        best: Optional[Tuple[float, float]] = None
+        best_d2 = float("inf")
+        r = int(radius)
+        for j in range(max(0, cy - r), min(self.height, cy + r + 1)):
+            for i in range(max(0, cx - r), min(self.width, cx + r + 1)):
+                if my_landmass != -1 and self._landmass[i][j] != my_landmass:
+                    continue
+                tile = self.tile_at(i, j)
+                if tile is None or tile.params["passable"] < 0.85:
+                    continue
+                if not self.can_drink_at(i + 0.5, j + 0.5):
+                    continue
+                d2 = (i + 0.5 - x) ** 2 + (j + 0.5 - y) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best = (float(i) + 0.5, float(j) + 0.5)
+        return best
+
+    def best_reachable_food_tile(
+        self, x: float, y: float, radius: int, min_food: float = 2.0,
+    ) -> Optional[Tuple[float, float]]:
+        """Find the tile with the most food within ``radius`` on the same landmass."""
+        cx, cy = int(x), int(y)
+        my_lm = self.landmass_id(x, y)
+        if my_lm == -1 or not self._landmass:
+            return None
+        lm = self._landmass
+        best: Optional[Tuple[float, float]] = None
+        best_food = min_food
+        r = int(radius)
+        xlo = max(0, cx - r)
+        xhi = min(self.width, cx + r + 1)
+        ylo = max(0, cy - r)
+        yhi = min(self.height, cy + r + 1)
+        for i in range(xlo, xhi):
+            row = lm[i]
+            trow = self._tile_grid[i]
+            for j in range(ylo, yhi):
+                if row[j] != my_lm:
+                    continue
+                tile = trow[j]
+                if tile is None:
+                    continue
+                if tile.food > best_food:
+                    best_food = tile.food
+                    best = (float(i) + 0.5, float(j) + 0.5)
+        return best
 
     # ----- access --------------------------------------------------------
     def tile_at(self, x: int, y: int) -> Optional[Tile]:
+        """O(1) tile lookup via 2D grid (falls back to dict if needed)."""
+        if self._tile_grid:
+            if x < 0 or y < 0 or x >= self.width or y >= self.height:
+                return None
+            return self._tile_grid[x][y]
+        # Fallback for worlds loaded from dict before grid is built.
         if x < 0 or y < 0 or x >= self.width or y >= self.height:
             return None
         idx = self._index.get((x, y))
@@ -285,6 +445,13 @@ class World:
 
     def tile_index(self, x: int, y: int) -> int:
         return self._index[(x, y)]
+
+    def _build_tile_grid(self) -> None:
+        """Build the 2D tile grid for O(1) ``tile_at`` lookups."""
+        grid: List[List[Optional[Tile]]] = [[None] * self.height for _ in range(self.width)]
+        for tile in self.tiles:
+            grid[tile.x][tile.y] = tile
+        self._tile_grid = grid
 
     def in_bounds(self, x: float, y: float) -> bool:
         return 0.0 <= x < self.width and 0.0 <= y < self.height
@@ -395,6 +562,9 @@ class World:
             tiles.append(tile)
         world.tiles = tiles
         world.resources = [ResourceNode.from_dict(r) for r in data["resources"]]
+        # Recompute landmass labels (cheaper than serialising the grid).
+        world._compute_landmasses()
+        world._build_tile_grid()
         return world
 
     # ----- queries used by the GUI --------------------------------------

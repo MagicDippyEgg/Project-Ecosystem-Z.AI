@@ -209,7 +209,7 @@ project_ecosystem/
 │       ├── world_view.py       # custom QPainter canvas
 │       ├── panels.py           # side panels & charts
 │       └── main_window.py      # main window & menus
-├── tests/                      # pytest suite (92 tests)
+├── tests/                      # pytest suite (134 tests)
 ├── scripts/
 │   ├── take_screenshots.py     # headless screenshot helper
 │   └── lib/                    # bundled libEGL for minimal systems
@@ -277,7 +277,7 @@ The test suite covers:
 - **Organism**: metabolism, death causes, foraging, hunting, fleeing,
   reproduction, cannibalism prevention, serialisation.
 - **World**: terrain determinism, biomes, food growth, water,
-  resources, day/night, serialisation.
+  resources, day/night, landmass reachability, serialisation.
 - **Weather**: event lifecycle, effects consistency, serialisation.
 - **Species**: founding, clustering, extinction, naming, serialisation.
 - **Simulation**: ticking, pause/speed, regeneration, population cap,
@@ -285,8 +285,88 @@ The test suite covers:
   round-trip.
 - **Persistence**: save/load, atomic writes, SaveManager, species &
   journal preservation.
+- **Navigation**: steering avoids water, line-of-sight, A* pathfinding
+  around obstacles, stuck detection, landmass reachability.
+- **AI behaviour**: organisms avoid water, escape unsafe terrain, find
+  food and water from shore tiles, flee predators, hunt prey, don't
+  pursue unreachable targets, rest when injured, populations survive
+  500–1000 ticks, multiple species coexist, continuous reproduction.
 - **GUI**: window construction, panel data, canvas painting,
   inspector, control signals, save/load (under offscreen QPA).
+
+---
+
+## Organism AI & survival intelligence
+
+Organisms use a **needs-urgency hierarchy** for decision-making, combined
+with **terrain-aware navigation** that prevents them from entering
+water or other unsafe terrain.
+
+### Navigation (3 layers)
+
+1. **Steering** (`ecosystem.core.navigation.steer_toward`) — every-tick
+   local obstacle avoidance. Evaluates the 8 neighbouring tiles and
+   picks the one that maximises progress toward the target while
+   staying on safe terrain (passable ≥ 0.85). Automatically routes
+   around water without needing full pathfinding.
+
+2. **Line-of-sight** (`line_of_sight_clear`) — Bresenham-line check
+   that prevents organisms from "jumping" over narrow water channels
+   when their speed exceeds 1 tile/tick.
+
+3. **A\* pathfinding** (`Pathfinder` class) — grid pathfinding with
+   caching and a node-expansion cap (350 nodes). Only invoked when an
+   organism gets stuck (no progress for 12 ticks). Paths are cached per
+   (start, goal) tile pair and shared across all organisms via the
+   simulation's `pathfinder` property.
+
+### Reachability
+
+The world precomputes **landmass labels** (flood-fill connected
+components of safe tiles at generation time). Two tiles are mutually
+reachable on foot iff they share the same landmass id. All target
+selection — food, water, mates — filters by landmass so organisms
+never pursue goals they can't reach.
+
+### Drinking without drowning
+
+Organisms drink from **shore tiles** — safe land tiles adjacent to
+water — without entering the water themselves. The
+`World.can_drink_at()` and `World.nearest_drinking_spot()` methods
+handle this, and additional **water springs** (resource nodes) are
+scattered across dry biomes so interior-dwelling organisms have access
+to hydration.
+
+### Decision hierarchy
+
+Each tick, an organism:
+
+1. **Escape** — if on an unsafe tile, immediately move to the nearest
+   safe tile.
+2. **Flee** — if a predator that can eat it is within ~8 tiles, flee
+   directly away (unless critically starving).
+3. **Assess needs** — health, hydration, energy, each with an urgency
+   score 0–1. Targets are pre-filtered to be reachable (same landmass).
+4. **Handle most urgent need** — drink, forage, hunt, or rest.
+5. **Reproduce** — if mature, well-fed, hydrated, healthy, and
+   reproduction won't drop energy below critical.
+6. **Opportunistic hunting** — predators below reproduction threshold.
+7. **Top up energy** — forage if below 80% of max.
+8. **Explore** — wander toward food-rich areas on the same landmass.
+
+### Survival behaviours
+
+- **Rest**: when health is low (< 55) or at night with high energy,
+  organisms rest (65% metabolism) and slowly recover health in mild
+  weather.
+- **Crowding stress**: metabolism scales mildly with local population
+  density (+4% per neighbour, capped at 8), creating natural carrying
+  capacity without preventing reproduction.
+- **Reproduction safety check**: organisms won't reproduce if it would
+  drop their energy below 15% of max, preventing self-endangering
+  reproduction.
+- **Needs caching**: target scans are cached for 3 ticks to avoid
+  O(radius²) tile scans every tick.
 
 ---
 

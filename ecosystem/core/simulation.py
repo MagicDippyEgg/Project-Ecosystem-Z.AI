@@ -27,6 +27,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .genome import Genome, random_genome, mutate
 from .journal import Journal
+from .navigation import Pathfinder
 from .organism import Organism, OrganismState, BirthRequest
 from .species import SpeciesRegistry, Species
 from .weather import WeatherSystem, WeatherType, WEATHER_LABELS
@@ -196,11 +197,23 @@ class Simulation:
         self._tick_accumulator: float = 0.0
         # Track deceased organisms briefly for the inspector (last N dead).
         self._recent_dead: List[Organism] = []
+        # Shared pathfinder (created lazily after the world exists).
+        self._pathfinder: Optional[Pathfinder] = None
         # Generate the world on construction.
         self.generate_world(self.config.seed, name=self.config_default_world_name())
 
     def config_default_world_name(self) -> str:
         return f"World #{self.config.seed & 0xFFFF:X}"
+
+    @property
+    def pathfinder(self) -> Pathfinder:
+        """Lazily-created shared :class:`Pathfinder` for the current world."""
+        if self._pathfinder is None and self.world is not None:
+            self._pathfinder = Pathfinder(self.world, max_nodes=350, cache_size=512)
+        if self._pathfinder is None:
+            # Should not happen, but be defensive.
+            raise RuntimeError("pathfinder requested before world exists")
+        return self._pathfinder
 
     # ------------------------------------------------------------------
     # World (re)generation
@@ -227,6 +240,7 @@ class Simulation:
         self._next_organism_id = 1
         self._recent_births = 0
         self._recent_deaths = []
+        self._pathfinder = None  # will be recreated on first use
         self.journal.add(0, "milestone", f"World '{name}' generated "
                                           f"({self.config.width}x{self.config.height}).")
         self._seed_initial_population()
@@ -273,8 +287,11 @@ class Simulation:
                     species_id=0,
                     birth_tick=0,
                     parent_ids=(),
-                    energy=45.0,   # below repro_threshold so founders forage first
+                    # Varied starting energy and age staggers reproduction
+                    # so the population doesn't boom in a single burst.
+                    energy=self.rng.uniform(35.0, 55.0),
                     hydration=75.0,
+                    age=self.rng.uniform(0.0, float(g["maturity_age"]) * 0.8),
                 )
                 sp = self.species.register_birth(org.id, g, 0, parent_species_id=None)
                 org.species_id = sp.id
@@ -398,16 +415,16 @@ class Simulation:
         for _ in range(req.litter_size):
             if len(self.organisms) >= self.config.max_population:
                 break
-            # Place offspring at a valid location.
+            # Place offspring at a valid (safe, land) location.
             x, y = req.x, req.y
-            if not self.world.passable_at(x, y):
-                # Nudge to nearest passable tile.
+            if not self.world.is_safe_tile(x, y):
+                # Nudge to nearest safe tile.
                 found = False
                 for r in range(1, 6):
                     for dj in range(-r, r + 1):
                         for di in range(-r, r + 1):
                             nx, ny = int(x) + di, int(y) + dj
-                            if self.world.passable_at(nx + 0.5, ny + 0.5):
+                            if self.world.is_safe_tile(nx + 0.5, ny + 0.5):
                                 x, y = nx + 0.5, ny + 0.5
                                 found = True
                                 break
@@ -652,6 +669,7 @@ class Simulation:
         sim.speed = float(data.get("speed", 1.0))
         sim._tick_accumulator = 0.0
         sim._recent_dead = []
+        sim._pathfinder = None
         sim._child_index_dirty = True
         return sim
 

@@ -1,20 +1,26 @@
-"""Organism: an individual living agent.
+"""Organism: an individual living agent with survival intelligence.
 
 Each organism is an autonomous agent that, every tick:
 
-1. Ages (and consumes energy proportional to its metabolism & size).
-2. Evaluates its needs (hunger, thirst, reproduction, safety).
-3. Picks a target (food, water, mate, or flee-from-predator) based on the
-   most pressing need and what it can *see* within its vision range.
-4. Moves toward that target, possibly interacting when it arrives.
-5. May reproduce, die of old age / starvation / dehydration / injury.
+1. Ages and consumes energy/water proportional to metabolism, size and
+   local crowding (competition stress).
+2. Assesses its situation: threats, vital needs (health, hydration,
+   energy), and available targets — all filtered by **reachability**
+   (same landmass, not across water).
+3. Acts on the highest-priority need using terrain-aware movement that
+   steers around water and obstacles. If steering gets it stuck, it
+   falls back to A* pathfinding (cached) to route around large
+   barriers.
+4. May reproduce, rest (to conserve energy), or die.
 
-The decision logic is deliberately simple (greedy over a need-weighted
-score) so that emergent behaviour arises from the interaction of many
-agents rather than from clever individual AI.
+The decision logic is a **needs-urgency hierarchy** rather than a flat
+priority list, so an organism that's both hungry and thirsty handles
+the more urgent one first. Targets are only pursued if reachable on
+the same landmass — organisms no longer walk into water chasing
+impossible goals.
 
-The class is plain Python (no Qt) and serialises itself to a dict, so the
-whole simulation can be saved/loaded as JSON.
+The class is plain Python (no Qt) and serialises itself to a dict, so
+the whole simulation can be saved/loaded as JSON.
 """
 
 from __future__ import annotations
@@ -26,6 +32,9 @@ from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .genome import Genome, recombine, mutate, random_genome
+from .navigation import (
+    Pathfinder, StuckDetector, land_safe, line_of_sight_clear, steer_toward,
+)
 
 if TYPE_CHECKING:  # avoid runtime circular import
     from .world import World
@@ -33,7 +42,7 @@ if TYPE_CHECKING:  # avoid runtime circular import
     from .species import Species
     from .simulation import Simulation
 
-__all__ = ["OrganismState", "Organism", "OrganismEvent"]
+__all__ = ["OrganismState", "Organism", "OrganismEvent", "BirthRequest"]
 
 
 class OrganismState(IntEnum):
@@ -46,7 +55,7 @@ class OrganismState(IntEnum):
     FLEEING = 4
     MATING = 5
     WANDERING = 6
-    RESTING = 7      # night-time low-energy state
+    RESTING = 7      # low-energy / low-health conservation
 
 
 STATE_LABELS = {
@@ -66,7 +75,7 @@ class OrganismEvent:
     """A single notable event in this organism's life - for the journal/inspector."""
 
     tick: int
-    kind: str          # 'birth','ate','drank','mated','gave_birth','fled','attacked','mutated','died','aged'
+    kind: str
     detail: str = ""
 
     def to_dict(self) -> Dict:
@@ -77,13 +86,24 @@ class OrganismEvent:
         return cls(tick=int(data["tick"]), kind=str(data["kind"]), detail=str(data.get("detail", "")))
 
 
+# ---------------------------------------------------------------------------
+# Need-urgency thresholds. Tuned so that an organism with comfortable
+# stats (energy > 60, hydration > 60, health > 70) has no urgent needs
+# and can reproduce or explore, while a struggling organism prioritises
+# survival.
+# ---------------------------------------------------------------------------
+HEALTH_CRITICAL = 35.0
+HEALTH_LOW = 55.0
+WATER_CRITICAL = 20.0
+WATER_LOW = 45.0
+ENERGY_CRITICAL_FRAC = 0.15   # fraction of max_energy
+ENERGY_LOW_FRAC = 0.50
+REST_HEALTH_RECOVER = 0.15    # health regained per tick while resting
+
+
 @dataclass
 class Organism:
-    """A single living (or dead) organism.
-
-    The fields are kept as plain attributes so PySide6's model/view code
-    can introspect them cheaply. ``genome`` is a :class:`Genome` instance.
-    """
+    """A single living (or dead) organism."""
 
     id: int
     genome: Genome
@@ -101,34 +121,40 @@ class Organism:
     state: OrganismState = OrganismState.IDLE
     target_x: Optional[float] = None
     target_y: Optional[float] = None
-    target_id: Optional[int] = None   # id of organism being chased/fled
-    cooldown_repro: int = 0           # ticks until can reproduce again
+    target_id: Optional[int] = None
+    cooldown_repro: int = 0
     # Memory
     events: List[OrganismEvent] = field(default_factory=list)
-    # Cached last action description, for the inspector's "current behaviour".
     last_action: str = "Just born"
-    # Reproduction counter
     offspring_count: int = 0
-    # Kills counter (for predators)
     kills: int = 0
     alive: bool = True
     death_tick: Optional[int] = None
     death_cause: str = ""
-    # Cached derived stats (recomputed when needed)
+    # --- Navigation state (not serialised; recomputed on load) ---
+    _path: List[Tuple[float, float]] = field(default_factory=list, repr=False)
+    _path_goal: Optional[Tuple[float, float]] = field(default=None, repr=False)
+    _stuck: StuckDetector = field(default_factory=StuckDetector, repr=False)
+    _resting_ticks: int = 0
+    # Cached needs assessment — only re-scan for targets every N ticks to
+    # avoid O(vision^2) tile scans every tick for every organism.
+    _needs_cache: List = field(default_factory=list, repr=False)
+    _needs_cache_tick: int = -999
+    _NEEDS_RESCAN_EVERY: int = 3
+    # Cached derived stats
     _max_energy: float = 100.0
     _size_radius: float = 0.35
 
-    # ------------------------------------------------------------------
-    # Construction & derived stats
-    # ------------------------------------------------------------------
     def __post_init__(self) -> None:
         self._recompute_derived()
 
     def _recompute_derived(self) -> None:
-        # Max energy scales with size: bigger = more storage but more upkeep.
         self._max_energy = 60.0 + 50.0 * self.genome["size"]
         self._size_radius = 0.18 + 0.22 * self.genome["size"]
 
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
     @property
     def max_energy(self) -> float:
         return self._max_energy
@@ -163,59 +189,53 @@ class Organism:
 
     @property
     def color(self) -> Tuple[float, float, float]:
-        """HSL colour derived from the genome."""
         return (self.genome["color_hue"], self.genome["color_sat"], self.genome["color_light"])
+
+    @property
+    def energy_critical(self) -> bool:
+        return self.energy < self._max_energy * ENERGY_CRITICAL_FRAC
+
+    @property
+    def energy_low(self) -> bool:
+        return self.energy < self._max_energy * ENERGY_LOW_FRAC
 
     # ------------------------------------------------------------------
     # Per-tick update
     # ------------------------------------------------------------------
     def step(self, world: "World", weather: "WeatherSystem", rng: random.Random, tick: int,
              neighbours: List["Organism"], sim: Optional["Simulation"] = None) -> Optional["BirthRequest"]:
-        """Advance this organism by one tick.
-
-        Returns a :class:`BirthRequest` if it reproduced this tick (so the
-        simulation can spawn the child without this module needing to know
-        about the wider population), otherwise ``None``.
-
-        ``sim`` is optional and used only for the long-range mate search
-        when the local neighbour window has no eligible mates.
-        """
         if not self.alive:
             return None
-        # 1. Metabolism: lose energy & water per tick. Crowding nearby
-        #    organisms increases energy cost (competition stress).
+        # Determine if resting (reduces metabolism).
+        resting = self.state == OrganismState.RESTING
         crowd = len(neighbours)
-        self._metabolise(world, weather, crowd)
-        # 2. Ageing.
+        self._metabolise(world, weather, crowd, resting)
         self.age += 1.0
-        # 3. Cooldowns.
         if self.cooldown_repro > 0:
             self.cooldown_repro -= 1
-        # 4. Death checks.
+        # Resting recovers a little health if not under extreme weather.
+        if resting and self.health < 100.0:
+            if 0.2 < weather.effective_temp < 0.8:
+                self.health = min(100.0, self.health + REST_HEALTH_RECOVER)
         if self._check_death(tick, world):
             return None
-        # 5. Decision making + action.
         return self._decide_and_act(world, weather, rng, tick, neighbours, sim)
 
-    def _metabolise(self, world: "World", weather: "WeatherSystem", crowd: int = 0) -> None:
-        # Energy cost: base + size^2 + speed (if moving) + metabolism.
-        size_cost = self.genome["size"] ** 2 * 0.18
-        meta_cost = self.genome["metabolism"] * 0.28
-        # Reduced metabolism at night (resting).
-        night_factor = 0.7 if not world.is_day() else 1.0
-        # Crowding stress: up to ~1.4x energy cost when 8+ neighbours.
-        # Mild enough to disperse populations but not prevent reproduction.
-        stress = 1.0 + 0.05 * min(crowd, 8)
-        # Hardiness reduces environmental damage.
+    def _metabolise(self, world: "World", weather: "WeatherSystem",
+                    crowd: int = 0, resting: bool = False) -> None:
+        size_cost = self.genome["size"] ** 2 * 0.14
+        meta_cost = self.genome["metabolism"] * 0.22
+        # Night or resting reduces metabolism.
+        factor = 0.65 if (resting or not world.is_day()) else 1.0
+        # Mild crowding stress.
+        stress = 1.0 + 0.04 * min(crowd, 8)
         env_damage = weather.damage_per_tick * (1.0 - 0.6 * self.genome["hardiness"])
-        self.energy -= (size_cost + meta_cost) * night_factor * stress
-        self.hydration -= self.genome["water_need"] * 0.18 * night_factor * stress
-        # Temperature stress: if effective temp far from comfort zone, lose health.
+        self.energy -= (size_cost + meta_cost) * factor * stress
+        self.hydration -= self.genome["water_need"] * 0.15 * factor * stress
         if weather.effective_temp > 0.85 or weather.effective_temp < 0.15:
             self.health -= env_damage
         else:
-            self.health -= env_damage * 0.4
-        # Clamp.
+            self.health -= env_damage * 0.35
         self.energy = max(0.0, self.energy)
         self.hydration = max(0.0, self.hydration)
         self.health = max(0.0, min(100.0, self.health))
@@ -243,7 +263,7 @@ class Organism:
         self.last_action = f"Died ({cause})"
 
     # ------------------------------------------------------------------
-    # Decision making
+    # Decision making — needs-urgency hierarchy
     # ------------------------------------------------------------------
     def _decide_and_act(
         self,
@@ -254,95 +274,216 @@ class Organism:
         neighbours: List["Organism"],
         sim: Optional["Simulation"] = None,
     ) -> Optional["BirthRequest"]:
-        # Vision range affected by daylight and weather.
         vision = self.genome["vision_range"] * world.daylight() * weather.vision_multiplier
-        vision = max(1.5, vision)
+        vision = max(2.5, vision)
 
-        # Threat detection: any predator within vision that targets us.
-        threats = [o for o in neighbours if o.alive and o.id != self.id and
-                   self._dist_to(o) <= vision and o.is_predator and
-                   o.genome["size"] >= self.genome["size"] * 0.8 and
-                   self._is_edible_to(o)]
+        # 1. Safety check: if somehow on an unsafe tile, escape immediately.
+        if not world.is_safe_tile(self.x, self.y):
+            return self._escape_to_safety(world, weather, rng, tick)
 
-        # 1) Flee if a predator is close and we're not starving.
-        if threats and self.energy > 12.0:
-            threat = min(threats, key=lambda o: self._dist_to(o))
-            return self._flee_from(world, weather, rng, tick, threat)
+        # 2. Detect and respond to threats.
+        threats = self._detect_threats(neighbours, vision)
+        if threats and self._should_flee(threats):
+            return self._flee_from(world, weather, rng, tick, threats)
 
-        # 2) Critical needs: water or food.
-        critical_water = self.hydration < 25.0
-        critical_food = self.energy < 25.0
+        # 3. Assess needs in urgency order (cached to avoid per-tick scans).
+        needs = self._get_needs(world, vision, tick)
+        if needs:
+            top = needs[0]
+            result = self._handle_need(top, world, weather, rng, tick, neighbours, vision, sim)
+            if result is not None:
+                return result
+            # If we acted on the need (state changed), don't also reproduce.
+            if self.state in (OrganismState.DRINKING, OrganismState.FORAGING,
+                              OrganismState.HUNTING, OrganismState.RESTING):
+                return None
 
-        if critical_water:
-            return self._seek_water(world, weather, rng, tick)
+        # 4. Reproduction (if healthy and mature).
+        if self._can_reproduce_safely():
+            result = self._seek_mate(world, weather, rng, tick, neighbours, vision, sim)
+            if result is not None:
+                return result
+            if self.state == OrganismState.MATING:
+                return None
 
-        if critical_food:
-            # Predators prefer hunting; herbivores prefer foraging.
-            if self.is_predator:
-                req = self._hunt(world, weather, rng, tick, neighbours, vision)
-                if req is not None:
-                    return req
-                # If we just attacked (state flipped to HUNTING), don't
-                # immediately forage on top of the prey.
-                if self.state == OrganismState.HUNTING:
+        # 5. Opportunistic hunting for hungry predators.
+        if self.is_predator and self.energy < self.genome["repro_threshold"]:
+            result = self._hunt(world, weather, rng, tick, neighbours, vision)
+            if result is not None or self.state == OrganismState.HUNTING:
+                return None
+
+        # 6. Top up energy if not full.
+        if self.energy < self._max_energy * 0.80:
+            return self._forage(world, weather, rng, tick, vision=vision, sim=sim)
+
+        # 7. Default: explore.
+        return self._explore(world, weather, rng, tick)
+
+    # ----- needs assessment --------------------------------------------
+    def _get_needs(self, world: "World", vision: float, tick: int):
+        """Cached wrapper around :meth:`_assess_needs`.
+
+        Needs are only re-scanned every ``_NEEDS_RESCAN_EVERY`` ticks (or
+        on the first call). Between scans, the cached target list is
+        returned. This avoids O(radius²) tile scans every tick for every
+        organism, which was the main performance bottleneck.
+        """
+        if tick - self._needs_cache_tick >= self._NEEDS_RESCAN_EVERY:
+            self._needs_cache = self._assess_needs(world, vision)
+            self._needs_cache_tick = tick
+        return self._needs_cache
+
+    def _assess_needs(self, world: "World", vision: float) -> List[Tuple[str, float, Optional[Tuple[float, float]]]]:
+        """Return needs sorted by urgency (highest first).
+
+        Each entry is ``(need_type, urgency_0_to_1, target_xy_or_None)``.
+        Targets are pre-filtered to be reachable (same landmass).
+        """
+        needs: List[Tuple[str, float, Optional[Tuple[float, float]]]] = []
+        max_e = self._max_energy
+        # Health
+        if self.health < HEALTH_LOW:
+            urg = (HEALTH_LOW - self.health) / HEALTH_LOW
+            needs.append(("health", urg, None))
+        # Hydration — search a wider radius than vision so interior
+        # dwellers can still find shore/springs.
+        if self.hydration < WATER_LOW:
+            urg = max(0.0, (WATER_LOW - self.hydration) / WATER_LOW)
+            search_r = max(int(vision) + 1, 15)
+            target = world.nearest_drinking_spot(self.x, self.y, search_r)
+            needs.append(("water", urg, target))
+        # Energy
+        if self.energy < max_e * ENERGY_LOW_FRAC:
+            urg = max(0.0, (max_e * ENERGY_LOW_FRAC - self.energy) / (max_e * ENERGY_LOW_FRAC))
+            target = world.best_reachable_food_tile(self.x, self.y, int(vision) + 1)
+            needs.append(("food", urg, target))
+        needs.sort(key=lambda n: -n[1])
+        return needs
+
+    def _handle_need(
+        self,
+        need: Tuple[str, float, Optional[Tuple[float, float]]],
+        world: "World",
+        weather: "WeatherSystem",
+        rng: random.Random,
+        tick: int,
+        neighbours: List["Organism"],
+        vision: float,
+        sim: Optional["Simulation"],
+    ) -> Optional["BirthRequest"]:
+        need_type, urgency, target = need
+        if need_type == "water":
+            return self._seek_water(world, weather, rng, tick, target, vision, sim)
+        if need_type == "food":
+            # Predators below critical energy try hunting first.
+            if self.is_predator and self.energy < self._max_energy * ENERGY_CRITICAL_FRAC:
+                result = self._hunt(world, weather, rng, tick, neighbours, vision)
+                if result is not None or self.state == OrganismState.HUNTING:
                     return None
-                return self._forage(world, weather, rng, tick, vision)
-            return self._forage(world, weather, rng, tick, vision)
+            return self._forage(world, weather, rng, tick, target, vision, sim)
+        if need_type == "health":
+            return self._rest(world, weather, rng, tick, reason="recovering")
+        return None
 
-        # 3) Reproduce if mature and well-fed.
-        if (self.is_mature and self.energy >= self.genome["repro_threshold"]
-                and self.cooldown_repro <= 0 and self.hydration > 35.0):
-            return self._seek_mate(world, weather, rng, tick, neighbours, vision, sim)
+    # ----- threat detection --------------------------------------------
+    def _detect_threats(self, neighbours: List["Organism"], vision: float) -> List["Organism"]:
+        """Return predators within vision that can eat us."""
+        return [o for o in neighbours if o.alive and o.id != self.id and
+                self._dist_to(o) <= vision and o.is_predator and
+                self._is_edible_to(o)]
 
-        # 4) Opportunistic hunting for predators.
-        if self.is_predator and self.energy < self.genome["repro_threshold"] * 0.8:
-            req = self._hunt(world, weather, rng, tick, neighbours, vision)
-            if req is not None:
-                return req
+    def _should_flee(self, threats: List["Organism"]) -> bool:
+        """Decide if fleeing is worth it.
 
-        # 5) Default: forage or wander toward denser food.
-        if self.energy < self._max_energy * 0.85:
-            return self._forage(world, weather, rng, tick, vision)
-        return self._wander(world, weather, rng, tick)
+        Flee if the closest predator is within ~60% of our vision and
+        we're not so critically starved that we'd die trying to run.
+        """
+        if not threats:
+            return False
+        closest = min(threats, key=lambda o: self._dist_to(o))
+        d = self._dist_to(closest)
+        # Flee if predator is close (within 8 tiles) or actively hunting us.
+        if d < 8.0:
+            return self.energy > self._max_energy * ENERGY_CRITICAL_FRAC * 0.5
+        return False
 
-    # ----- actions -------------------------------------------------------
+    # ----- actions ------------------------------------------------------
     def _flee_from(self, world: "World", weather: "WeatherSystem", rng: random.Random,
-                   tick: int, threat: "Organism") -> None:
-        # Move directly away from the threat.
+                   tick: int, threats: List["Organism"]) -> None:
+        threat = min(threats, key=lambda o: self._dist_to(o))
+        # Move directly away from the threat, using safe steering.
         dx = self.x - threat.x
         dy = self.y - threat.y
         d = math.hypot(dx, dy) or 1.0
-        self._move_toward(world, self.x + dx / d * 3.0, self.y + dy / d * 3.0)
+        flee_dist = 4.0
+        tx = self.x + dx / d * flee_dist
+        ty = self.y + dy / d * flee_dist
+        # Clamp to world bounds.
+        tx = max(1.0, min(world.width - 1.0, tx))
+        ty = max(1.0, min(world.height - 1.0, ty))
+        self._move_toward(world, tx, ty)
         self.state = OrganismState.FLEEING
         self.last_action = f"Fleeing from predator #{threat.id}"
         self.events.append(OrganismEvent(tick=tick, kind="fled", detail=f"#{threat.id}"))
+        # Clear any pending path.
+        self._path.clear()
+        self._path_goal = None
 
     def _seek_water(self, world: "World", weather: "WeatherSystem", rng: random.Random,
-                    tick: int) -> None:
-        # Look for water tiles or water resource nodes in vision.
-        tx, ty = self._nearest_water(world, vision=self.genome["vision_range"])
-        if tx is None:
-            self._wander(world, weather, rng, tick)
-            self.last_action = "Thirsty; searching for water"
-            return
-        if math.hypot(tx - self.x, ty - self.y) < 1.5:
-            drank = world.drink_water(int(self.x), int(self.y), 25.0)
-            self.hydration = min(100.0, self.hydration + drank)
+                    tick: int, target: Optional[Tuple[float, float]],
+                    vision: float, sim: Optional["Simulation"]) -> None:
+        # If we can drink right here, do so.
+        if world.can_drink_at(self.x, self.y):
+            drank = self._drink_from(world)
             if drank > 0:
                 self.state = OrganismState.DRINKING
                 self.last_action = f"Drinking (+{drank:.0f} hydration)"
                 self.events.append(OrganismEvent(tick=tick, kind="drank", detail=f"+{drank:.0f}"))
-        else:
-            self._move_toward(world, tx, ty)
-            self.state = OrganismState.DRINKING
-            self.last_action = "Heading to water"
+                return
+        if target is None:
+            # No water in vision — wander to search.
+            self._explore(world, weather, rng, tick, prefer_near_water=True)
+            self.last_action = "Thirsty; searching for water"
+            return
+        # Move toward the drinking spot safely.
+        d = math.hypot(target[0] - self.x, target[1] - self.y)
+        if d < 1.5:
+            drank = self._drink_from(world)
+            if drank > 0:
+                self.state = OrganismState.DRINKING
+                self.last_action = f"Drinking (+{drank:.0f} hydration)"
+                self.events.append(OrganismEvent(tick=tick, kind="drank", detail=f"+{drank:.0f}"))
+                return
+        self._move_toward(world, target[0], target[1], sim=sim)
+        self.state = OrganismState.DRINKING
+        self.last_action = "Heading to water"
+
+    def _drink_from(self, world: "World") -> float:
+        """Drink from adjacent water without entering it."""
+        # Try water resource nodes first.
+        for res in world.resources:
+            if res.kind.name == "WATER" and abs(res.x - self.x) <= 1.5 and abs(res.y - self.y) <= 1.5:
+                return res.consume(25.0)
+        # Else drink from adjacent water tile (infinite).
+        ix, iy = int(self.x), int(self.y)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                tile = world.tile_at(ix + dx, iy + dy)
+                if tile is not None and tile.has_water:
+                    drank = 25.0
+                    self.hydration = min(100.0, self.hydration + drank)
+                    return drank
+        return 0.0
 
     def _forage(self, world: "World", weather: "WeatherSystem", rng: random.Random,
-                tick: int, vision: float) -> None:
-        # Eat plant food at current tile if any.
+                tick: int, target: Optional[Tuple[float, float]] = None,
+                vision: float = 0.0, sim: Optional["Simulation"] = None) -> None:
+        # Eat plant food at current tile if there's a meaningful amount.
+        # This keeps organisms dispersed instead of all rushing to the
+        # single best food tile (which causes local overgrazing).
         tile = world.tile_at(int(self.x), int(self.y))
-        if tile is not None and tile.food > 1.0:
-            want = min(self._max_energy - self.energy, 9.0)
+        if tile is not None and tile.food > 0.5:
+            want = min(self._max_energy - self.energy, 10.0)
             eaten = world.consume_plant_food(tile.x, tile.y, want)
             if eaten > 0:
                 gained = eaten * tile.params["food_value"]
@@ -351,26 +492,35 @@ class Organism:
                 self.last_action = f"Grazing (+{gained:.0f} energy)"
                 self.events.append(OrganismEvent(tick=tick, kind="ate", detail=f"plant +{gained:.0f}"))
                 return
-        # Else move toward the tile with the most food within vision.
-        best = self._best_food_tile(world, vision)
-        if best is not None:
-            self._move_toward(world, best[0], best[1])
+        # Current tile is bare — move toward the target or search.
+        if target is not None:
+            self._move_toward(world, target[0], target[1], sim=sim)
             self.state = OrganismState.FORAGING
             self.last_action = "Foraging toward food"
             return
-        self._wander(world, weather, rng, tick)
+        if vision > 0:
+            reachable = world.best_reachable_food_tile(self.x, self.y, int(vision) + 1)
+            if reachable is not None:
+                self._move_toward(world, reachable[0], reachable[1], sim=sim)
+                self.state = OrganismState.FORAGING
+                self.last_action = "Foraging toward food"
+                return
+        # No food found — explore toward food-rich areas.
+        self._explore(world, weather, rng, tick)
         self.last_action = "Foraging; no food in sight"
 
     def _hunt(self, world: "World", weather: "WeatherSystem", rng: random.Random,
               tick: int, neighbours: List["Organism"], vision: float) -> Optional["BirthRequest"]:
+        # Only hunt prey on the same landmass.
         prey = [o for o in neighbours if o.alive and o.id != self.id and
-                self._can_eat(o) and self._dist_to(o) <= vision]
+                self._can_eat(o) and self._dist_to(o) <= vision and
+                world.same_landmass(self.x, self.y, o.x, o.y)]
         if not prey:
             return None
-        target = min(prey, key=lambda o: self._dist_to(o))
+        # Prefer the closest, weakest prey.
+        target = min(prey, key=lambda o: self._dist_to(o) + o.health * 0.01)
         d = self._dist_to(target)
         if d < 0.8:
-            # Attack!
             damage = 30.0 + 40.0 * self.genome["aggression"] + 20.0 * self.genome["size"]
             target.health -= damage
             self.state = OrganismState.HUNTING
@@ -378,7 +528,6 @@ class Organism:
             self.events.append(OrganismEvent(tick=tick, kind="attacked", detail=f"#{target.id}"))
             target.events.append(OrganismEvent(tick=tick, kind="attacked", detail=f"by #{self.id}"))
             if target.health <= 0:
-                # Consume the prey's energy.
                 gained = min(self._max_energy - self.energy, target.energy * 0.7 + 30.0)
                 self.energy = min(self._max_energy, self.energy + gained)
                 self.kills += 1
@@ -386,7 +535,6 @@ class Organism:
                 self.last_action = f"Killed #{target.id} (+{gained:.0f})"
                 self.events.append(OrganismEvent(tick=tick, kind="ate", detail=f"prey #{target.id} +{gained:.0f}"))
             return None
-        # Move toward prey.
         self._move_toward(world, target.x, target.y)
         self.target_id = target.id
         self.state = OrganismState.HUNTING
@@ -397,70 +545,78 @@ class Organism:
                    tick: int, neighbours: List["Organism"], vision: float,
                    sim: Optional["Simulation"] = None,
                    ) -> Optional["BirthRequest"]:
-        # Eligible mates: same species, mature, high energy, off cooldown.
+        # Eligible mates on the same landmass.
         mates = [o for o in neighbours if o.alive and o.id != self.id and
                  o.species_id == self.species_id and o.is_mature and
                  o.energy >= o.genome["repro_threshold"] and o.cooldown_repro <= 0 and
-                 self._dist_to(o) <= vision]
+                 self._dist_to(o) <= vision and
+                 world.same_landmass(self.x, self.y, o.x, o.y)]
+        if not mates and sim is not None:
+            # Long-range search through the spatial hash, filtered by landmass.
+            far_mate = sim.find_nearest_potential_mate(self, max_cells=4)
+            if far_mate is not None and world.same_landmass(self.x, self.y, far_mate.x, far_mate.y):
+                self._move_toward(world, far_mate.x, far_mate.y, sim=sim)
+                if far_mate.state not in (OrganismState.FLEEING, OrganismState.HUNTING):
+                    far_mate._move_toward(world, self.x, self.y)
+                    far_mate.state = OrganismState.MATING
+                    far_mate.last_action = f"Heading toward distant mate #{self.id}"
+                self.state = OrganismState.MATING
+                self.last_action = f"Heading toward distant mate #{far_mate.id}"
+                return None
         if not mates:
-            # Try a longer-range search through the simulation's spatial hash.
-            if sim is not None:
-                far_mate = sim.find_nearest_potential_mate(self, max_cells=4)
-                if far_mate is not None:
-                    self._move_toward(world, far_mate.x, far_mate.y)
-                    # Nudge the mate to head toward us too, so they actually meet.
-                    if far_mate.state not in (OrganismState.FLEEING, OrganismState.HUNTING):
-                        far_mate._move_toward(world, self.x, self.y)
-                        far_mate.state = OrganismState.MATING
-                        far_mate.last_action = f"Heading toward distant mate #{self.id}"
-                    self.state = OrganismState.MATING
-                    self.last_action = f"Heading toward distant mate #{far_mate.id}"
-                    return None
-            # Move toward nearest same-species mature organism in vision.
             same_species = [o for o in neighbours if o.alive and o.id != self.id and
-                            o.species_id == self.species_id and self._dist_to(o) <= vision]
+                            o.species_id == self.species_id and self._dist_to(o) <= vision and
+                            world.same_landmass(self.x, self.y, o.x, o.y)]
             if same_species:
                 target = min(same_species, key=lambda o: self._dist_to(o))
-                self._move_toward(world, target.x, target.y)
+                self._move_toward(world, target.x, target.y, sim=sim)
                 self.state = OrganismState.MATING
                 self.last_action = f"Approaching mate #{target.id}"
                 return None
-            self._wander(world, weather, rng, tick)
-            self.last_action = "Searching for a mate"
-            return None
+            return None  # Don't wander — let the caller decide.
         mate = min(mates, key=lambda o: self._dist_to(o))
         d = self._dist_to(mate)
-        # Reproduction distance scales with organism size so bigger creatures
-        # don't need to be pixel-perfect.
         repro_dist = 2.0 + 0.8 * (self.genome["size"] + mate.genome["size"]) * 0.5
         if d < repro_dist:
             return self._reproduce_with(mate, rng, tick)
-        # Both move toward each other for faster convergence.
-        self._move_toward(world, mate.x, mate.y)
+        self._move_toward(world, mate.x, mate.y, sim=sim)
         if mate.state not in (OrganismState.FLEEING, OrganismState.HUNTING):
             mate._move_toward(world, self.x, self.y)
         self.state = OrganismState.MATING
         self.last_action = f"Moving toward mate #{mate.id}"
         return None
 
+    def _can_reproduce_safely(self) -> bool:
+        """True if reproduction won't immediately endanger the organism."""
+        if not self.is_mature or self.cooldown_repro > 0:
+            return False
+        if self.energy < self.genome["repro_threshold"]:
+            return False
+        if self.hydration < WATER_LOW:
+            return False
+        if self.health < HEALTH_LOW:
+            return False
+        # Don't reproduce if it would drop energy below critical — but
+        # allow it if the organism is well above the threshold.
+        if self.energy - self.genome["offspring_energy"] < self._max_energy * ENERGY_CRITICAL_FRAC:
+            return False
+        return True
+
     def _reproduce_with(self, mate: "Organism", rng: random.Random, tick: int) -> "BirthRequest":
         child_genome = recombine(self.genome, mate.genome, rng)
-        # Split offspring energy cost between parents.
         cost_a = self.genome["offspring_energy"]
         cost_b = mate.genome["offspring_energy"]
         self.energy -= cost_a
         mate.energy -= cost_b
-        self.cooldown_repro = 60
-        mate.cooldown_repro = 60
+        self.cooldown_repro = 70
+        mate.cooldown_repro = 70
         self.offspring_count += 1
         mate.offspring_count += 1
-        litter = int(child_genome["litter_size"])
-        litter = max(1, min(litter, 3))
+        litter = max(1, min(int(child_genome["litter_size"]), 3))
         self.events.append(OrganismEvent(tick=tick, kind="gave_birth", detail=f"#{mate.id} x{litter_count_label(litter)}"))
         mate.events.append(OrganismEvent(tick=tick, kind="gave_birth", detail=f"#{self.id} x{litter_count_label(litter)}"))
         self.last_action = f"Mated with #{mate.id}"
         mate.last_action = f"Mated with #{self.id}"
-        # Position offspring near the parents.
         cx = 0.5 * (self.x + mate.x) + rng.uniform(-1.0, 1.0)
         cy = 0.5 * (self.y + mate.y) + rng.uniform(-1.0, 1.0)
         return BirthRequest(
@@ -472,107 +628,217 @@ class Organism:
             tick=tick,
         )
 
-    def _wander(self, world: "World", weather: "WeatherSystem", rng: random.Random,
-                tick: int) -> None:
-        # Drift in the current heading, occasionally turning.
-        if self.target_x is None or self.target_y is None or rng.random() < 0.08:
-            self.target_x = self.x + rng.uniform(-6.0, 6.0)
-            self.target_y = self.y + rng.uniform(-6.0, 6.0)
-        self._move_toward(world, self.target_x, self.target_y)
-        # If reached target, clear it.
-        if math.hypot(self.target_x - self.x, self.target_y - self.y) < 1.0:
-            self.target_x = None
-            self.target_y = None
-        # Resting at night if well-fed.
-        if not world.is_day() and self.energy > self._max_energy * 0.7:
+    def _rest(self, world: "World", weather: "WeatherSystem", rng: random.Random,
+              tick: int, reason: str = "") -> None:
+        self.state = OrganismState.RESTING
+        self._resting_ticks += 1
+        self.last_action = f"Resting ({reason})" if reason else "Resting"
+        # Clear movement targets.
+        self.target_x = None
+        self.target_y = None
+        self._path.clear()
+        self._path_goal = None
+
+    def _explore(self, world: "World", weather: "WeatherSystem", rng: random.Random,
+                 tick: int, prefer_near_water: bool = False) -> None:
+        """Wander toward a safe, food-rich area. Stays on safe terrain."""
+        # Pick a wander target that's on safe ground.
+        if self.target_x is None or self.target_y is None or rng.random() < 0.05:
+            # Try to find a nearby food-rich tile to wander toward.
+            best = None
+            best_food = 0.5
+            cx, cy = int(self.x), int(self.y)
+            my_lm = world.landmass_id(self.x, self.y)
+            r = 8
+            for j in range(max(0, cy - r), min(world.height, cy + r + 1)):
+                for i in range(max(0, cx - r), min(world.width, cx + r + 1)):
+                    if my_lm != -1 and world._landmass[i][j] != my_lm:
+                        continue
+                    tile = world.tile_at(i, j)
+                    if tile is None or tile.params["passable"] < 0.85:
+                        continue
+                    score = tile.food * 0.5
+                    if prefer_near_water and world.can_drink_at(i + 0.5, j + 0.5):
+                        score += 10.0
+                    if score > best_food:
+                        best_food = score
+                        best = (float(i) + 0.5, float(j) + 0.5)
+            if best is not None:
+                self.target_x, self.target_y = best
+            else:
+                # Random safe direction.
+                for _attempt in range(10):
+                    angle = rng.uniform(0, 2 * math.pi)
+                    dist = rng.uniform(4, 10)
+                    tx = self.x + math.cos(angle) * dist
+                    ty = self.y + math.sin(angle) * dist
+                    if world.is_safe_tile(tx, ty):
+                        self.target_x = tx
+                        self.target_y = ty
+                        break
+                else:
+                    self.target_x = self.x
+                    self.target_y = self.y
+        if self.target_x is not None and self.target_y is not None:
+            self._move_toward(world, self.target_x, self.target_y)
+            if math.hypot(self.target_x - self.x, self.target_y - self.y) < 1.5:
+                self.target_x = None
+                self.target_y = None
+        if not world.is_day() and self.energy > self._max_energy * 0.65:
             self.state = OrganismState.RESTING
             self.last_action = "Resting (night)"
         else:
             self.state = OrganismState.WANDERING
-            self.last_action = "Wandering"
+            self.last_action = "Exploring"
 
-    # ----- helpers -------------------------------------------------------
-    def _move_toward(self, world: "World", tx: float, ty: float) -> None:
+    def _escape_to_safety(self, world: "World", weather: "WeatherSystem",
+                          rng: random.Random, tick: int) -> None:
+        """Move to the nearest safe tile (used if somehow on water/unsafe)."""
+        best = None
+        best_d2 = float("inf")
+        cx, cy = int(self.x), int(self.y)
+        for ring in range(1, 6):
+            found = False
+            for dy in range(-ring, ring + 1):
+                for dx in range(-ring, ring + 1):
+                    if max(abs(dx), abs(dy)) != ring:
+                        continue
+                    nx, ny = cx + dx, cy + dy
+                    if not (0 <= nx < world.width and 0 <= ny < world.height):
+                        continue
+                    tile = world.tile_at(nx, ny)
+                    if tile is not None and tile.params["passable"] >= 0.85:
+                        d2 = (nx - self.x) ** 2 + (ny - self.y) ** 2
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best = (float(nx) + 0.5, float(ny) + 0.5)
+                            found = True
+            if found:
+                break
+        if best is not None:
+            speed = self.genome["speed"] * 0.7  # move faster when escaping
+            self.x = best[0]
+            self.y = best[1]
+            self.x = max(0.1, min(world.width - 0.1, self.x))
+            self.y = max(0.1, min(world.height - 0.1, self.y))
+        self.state = OrganismState.FLEEING
+        self.last_action = "Escaping unsafe terrain"
+        self.events.append(OrganismEvent(tick=tick, kind="fled", detail="unsafe terrain"))
+
+    # ------------------------------------------------------------------
+    # Movement — terrain-aware steering with A* fallback
+    # ------------------------------------------------------------------
+    def _move_toward(self, world: "World", tx: float, ty: float,
+                     sim: Optional["Simulation"] = None) -> None:
+        """Move toward ``(tx, ty)`` using safe steering, with A* fallback.
+
+        The organism first tries :func:`steer_toward` (cheap local
+        avoidance). If it gets stuck (no progress for several ticks),
+        it requests an A* path from the simulation's shared
+        :class:`Pathfinder` and follows the waypoints until the goal is
+        reached or the path becomes stale.
+        """
         dx = tx - self.x
         dy = ty - self.y
-        d = math.hypot(dx, dy)
-        if d < 1e-6:
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
             return
         speed = self.genome["speed"] * 0.5
-        nx = self.x + dx / d * speed
-        ny = self.y + dy / d * speed
-        # Try to move; if blocked by impassable terrain, slide along axis.
-        if world.passable_at(nx, ny):
+        # Update stuck detector.
+        self._stuck.update(dist, target_id=int(tx * 10000 + ty))
+
+        # If we have a cached path toward this goal, follow it.
+        goal_key = (int(tx), int(ty))
+        if self._path and self._path_goal == goal_key:
+            waypoint = self._path[0]
+            wdist = math.hypot(waypoint[0] - self.x, waypoint[1] - self.y)
+            if wdist < 1.0:
+                self._path.pop(0)
+                if not self._path:
+                    self._path_goal = None
+                else:
+                    waypoint = self._path[0]
+            nx, ny = steer_toward(world, self.x, self.y, waypoint[0], waypoint[1], speed)
             self.x = nx
             self.y = ny
-        elif world.passable_at(nx, self.y):
-            self.x = nx
-        elif world.passable_at(self.x, ny):
-            self.y = ny
-        # Clamp to world bounds.
-        self.x = max(0.1, min(world.width - 0.1, self.x))
-        self.y = max(0.1, min(world.height - 0.1, self.y))
+            self._clamp_to_bounds(world)
+            self.target_x = tx
+            self.target_y = ty
+            return
+
+        # Try direct steering first.
+        nx, ny = steer_toward(world, self.x, self.y, tx, ty, speed)
+        # Final safety check: never move to an unsafe tile. If steering
+        # somehow returned an unsafe position (e.g. the organism was
+        # nudged by another organism's mate-seeking), stay put instead.
+        if not world.is_safe_tile(nx, ny):
+            # Try to find a safe adjacent tile to move to.
+            cx, cy = int(self.x), int(self.y)
+            escaped = False
+            for ddx in (-1, 0, 1):
+                for ddy in (-1, 0, 1):
+                    if ddx == 0 and ddy == 0:
+                        continue
+                    test_tile = world.tile_at(cx + ddx, cy + ddy)
+                    if test_tile is not None and test_tile.params["passable"] >= 0.85:
+                        nx = float(cx + ddx) + 0.5
+                        ny = float(cy + ddy) + 0.5
+                        escaped = True
+                        break
+                if escaped:
+                    break
+            if not escaped:
+                nx, ny = self.x, self.y  # stay put
+        moved = math.hypot(nx - self.x, ny - self.y) > 0.01
+        self.x = nx
+        self.y = ny
+        self._clamp_to_bounds(world)
         self.target_x = tx
         self.target_y = ty
 
+        # If steering made no progress, try A* pathfinding.
+        if not moved and sim is not None and not self._stuck.is_stuck():
+            # Mark as stuck to avoid re-triggering every tick.
+            self._stuck.update(dist + 0.001, target_id=int(tx * 10000 + ty))
+        if sim is not None and self._stuck.is_stuck() and not self._path:
+            pathfinder = sim.pathfinder
+            path = pathfinder.find_path(self.x, self.y, tx, ty)
+            if path is not None and len(path) > 1:
+                self._path = path[1:]  # skip the start tile
+                self._path_goal = goal_key
+            else:
+                # No path found — give up on this target.
+                self.target_x = None
+                self.target_y = None
+                self._stuck.reset()
+            # Reset stuck detector either way.
+            self._stuck.reset()
+
+    def _clamp_to_bounds(self, world: "World") -> None:
+        self.x = max(0.1, min(world.width - 0.1, self.x))
+        self.y = max(0.1, min(world.height - 0.1, self.y))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
     def _dist_to(self, other: "Organism") -> float:
         return math.hypot(other.x - self.x, other.y - self.y)
 
     def _is_edible_to(self, predator: "Organism") -> bool:
-        """Return True if ``predator`` can eat *us* (``self``)."""
+        """Return True if ``predator`` can eat *us*."""
         if predator.species_id == self.species_id:
             return False
         if predator.genome["diet"] < 0.4:
             return False
-        # Size advantage needed.
         return predator.genome["size"] >= self.genome["size"] * 0.85
 
     def _can_eat(self, other: "Organism") -> bool:
-        """Return True if *we* (``self``) can eat ``other``."""
+        """Return True if *we* can eat ``other``."""
         if self.species_id == other.species_id:
             return False
         if self.genome["diet"] < 0.4:
             return False
         return self.genome["size"] >= other.genome["size"] * 0.85
-
-    def _nearest_water(self, world: "World", vision: float) -> Tuple[Optional[float], Optional[float]]:
-        # Check water resource nodes first.
-        nodes = world.resource_nodes_in_radius(self.x, self.y, vision, kind=None)
-        water_nodes = [r for r in nodes if r.kind.name == "WATER"]
-        if water_nodes:
-            best = min(water_nodes, key=lambda r: (r.x - self.x) ** 2 + (r.y - self.y) ** 2)
-            return best.x, best.y
-        # Scan a window of tiles for water.
-        cx, cy = int(self.x), int(self.y)
-        r = int(vision) + 1
-        best: Optional[Tuple[float, float]] = None
-        best_d = float("inf")
-        for j in range(max(0, cy - r), min(world.height, cy + r + 1)):
-            for i in range(max(0, cx - r), min(world.width, cx + r + 1)):
-                tile = world.tile_at(i, j)
-                if tile is not None and tile.has_water:
-                    d = (i - self.x) ** 2 + (j - self.y) ** 2
-                    if d < best_d:
-                        best_d = d
-                        best = (float(i), float(j))
-        if best is None:
-            return None, None
-        return best
-
-    def _best_food_tile(self, world: "World", vision: float) -> Optional[Tuple[float, float]]:
-        cx, cy = int(self.x), int(self.y)
-        r = int(vision) + 1
-        best: Optional[Tuple[float, float]] = None
-        best_food = 1.0  # only consider tiles with food > 1
-        for j in range(max(0, cy - r), min(world.height, cy + r + 1)):
-            for i in range(max(0, cx - r), min(world.width, cx + r + 1)):
-                tile = world.tile_at(i, j)
-                if tile is None or not tile.passable:
-                    continue
-                if tile.food > best_food:
-                    best_food = tile.food
-                    best = (float(i), float(j))
-        return best
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -594,7 +860,7 @@ class Organism:
             "target_y": self.target_y,
             "target_id": self.target_id,
             "cooldown_repro": self.cooldown_repro,
-            "events": [e.to_dict() for e in self.events[-64:]],  # cap memory
+            "events": [e.to_dict() for e in self.events[-64:]],
             "last_action": self.last_action,
             "offspring_count": self.offspring_count,
             "kills": self.kills,
@@ -605,7 +871,7 @@ class Organism:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Organism":
-        org = cls(
+        return cls(
             id=int(data["id"]),
             genome=Genome.from_json(data["genome"]),
             x=float(data["x"]), y=float(data["y"]),
@@ -629,11 +895,10 @@ class Organism:
             death_tick=data.get("death_tick"),
             death_cause=str(data.get("death_cause", "")),
         )
-        return org
 
 
 # ---------------------------------------------------------------------------
-# BirthRequest - a value object returned by step() when reproduction happens
+# BirthRequest
 # ---------------------------------------------------------------------------
 @dataclass
 class BirthRequest:
@@ -647,5 +912,4 @@ class BirthRequest:
 
 
 def litter_count_label(n: int) -> str:
-    """Tiny helper so the mating-event label says 'x2' etc."""
     return str(n)

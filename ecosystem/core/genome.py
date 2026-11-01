@@ -80,9 +80,9 @@ TRAIT_SPECS: Dict[str, TraitSpec] = {
     "vision_range": TraitSpec("vision_range", 2.0, 22.0, 10.0),
 
     # Life history
-    "max_age": TraitSpec("max_age", 200.0, 1000.0, 520.0),
+    "max_age": TraitSpec("max_age", 200.0, 1000.0, 600.0),
     "maturity_age": TraitSpec("maturity_age", 18.0, 90.0, 40.0),
-    "repro_threshold": TraitSpec("repro_threshold", 45.0, 92.0, 65.0),
+    "repro_threshold": TraitSpec("repro_threshold", 45.0, 92.0, 55.0),
     "offspring_energy": TraitSpec("offspring_energy", 18.0, 55.0, 32.0),
     "litter_size": TraitSpec("litter_size", 1.0, 3.0, 1.0, integer=True),
 
