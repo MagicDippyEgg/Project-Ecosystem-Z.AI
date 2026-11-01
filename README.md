@@ -137,6 +137,21 @@ or
 python -m ecosystem.app
 ```
 
+### Pre-built executable
+
+A single-file Linux executable is built automatically by the
+[GitHub Action](https://github.com/MagicDippyEgg/Project-Ecosystem-Z.AI/actions)
+on every push and tag. Download it from the **Actions → Build Single
+Executable → Artifacts** section, make it executable (`chmod +x`), and
+run it directly — no Python installation required.
+
+Tagged releases (`v*`) also attach the executable to the corresponding
+[Release](https://github.com/MagicDippyEgg/Project-Ecosystem-Z.AI/releases).
+
+> **Note:** The executable is ~260 MB because it bundles PySide6/Qt6.
+> This is normal for PySide6 single-file apps. The source package +
+> `pip install` is much smaller if you already have Python.
+
 ### Headless / offscreen mode
 
 If you have no display server (e.g. CI, SSH):
@@ -198,7 +213,11 @@ project_ecosystem/
 ├── scripts/
 │   ├── take_screenshots.py     # headless screenshot helper
 │   └── lib/                    # bundled libEGL for minimal systems
+├── .github/workflows/
+│   └── build.yml               # CI: tests + PyInstaller executable
 ├── saves/                      # save directory
+├── launcher.py                 # PyInstaller entry point
+├── project_ecosystem.spec      # PyInstaller spec
 ├── run.sh                      # launcher
 ├── setup.py / pyproject.toml   # packaging
 └── requirements.txt
@@ -207,6 +226,40 @@ project_ecosystem/
 The **core** package has no Qt dependency, so the simulation can be
 imported, scripted and tested headlessly. The **gui** package wraps it
 in a native PySide6 window.
+
+---
+
+## Building a single executable
+
+The project includes a PyInstaller spec (`project_ecosystem.spec`) that
+bundles the app and all its dependencies into a single self-contained
+Linux executable.
+
+### Locally
+
+```bash
+pip install pyinstaller
+pyinstaller project_ecosystem.spec --noconfirm
+# Result: dist/project-ecosystem (~260 MB, single ELF binary)
+```
+
+### CI (GitHub Actions)
+
+The [build workflow](.github/workflows/build.yml) runs on every push,
+pull request, tag, and manual dispatch. It:
+
+1. **Tests** the full suite on Ubuntu 22.04.
+2. **Builds** the executable with PyInstaller.
+3. **Smoke-tests** it (launches in offscreen mode, verifies it doesn't
+   crash within 3 seconds).
+4. **Uploads** the executable and a source tarball as workflow
+   artifacts (30-day retention).
+5. On **tag pushes** (`v*`), **attaches** both to the corresponding
+   GitHub release automatically.
+
+Download the latest build from the
+[Actions tab](https://github.com/MagicDippyEgg/Project-Ecosystem-Z.AI/actions) →
+click the latest run → scroll to **Artifacts**.
 
 ---
 

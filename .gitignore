@@ -35,4 +35,9 @@ Thumbs.db
 saves/*.json
 !saves/.gitkeep
 scripts/lib/*.so*
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
 scripts/lib/
