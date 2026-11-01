@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "project-ecosystem"
+version = "1.0.0"
+description = "A native Linux desktop artificial life simulation."
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "PySide6>=6.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov"]
+
+[project.scripts]
+project-ecosystem = "ecosystem.app:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
